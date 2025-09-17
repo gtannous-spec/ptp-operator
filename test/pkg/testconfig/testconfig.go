@@ -1463,6 +1463,11 @@ func createConfig(profileName string, ifaceName, ptp4lOpts *string, ptp4lConfig 
 	return err
 }
 
+// CreatePtpConfig is an exported wrapper for the unexported createConfig function.
+func CreatePtpConfig(profileName string, ifaceName, ptp4lOpts *string, ptp4lConfig string, phc2sysOpts *string, nodeLabel string, priority *int64, ptpSchedulingPolicy string, ptpSchedulingPriority *int64) error {
+	return createConfig(profileName, ifaceName, ptp4lOpts, ptp4lConfig, phc2sysOpts, nodeLabel, priority, ptpSchedulingPolicy, ptpSchedulingPriority)
+}
+
 // Discovers the PTP configuration
 func discoverPTPConfiguration(namespace string) {
 	var ptpConfigClockUnderTest []*ptpv1.PtpConfig
