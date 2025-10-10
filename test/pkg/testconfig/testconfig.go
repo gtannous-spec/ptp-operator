@@ -1464,8 +1464,19 @@ func createConfig(profileName string, ifaceName, ptp4lOpts *string, ptp4lConfig 
 }
 
 // CreatePtpConfig is an exported wrapper for the unexported createConfig function.
-func CreatePtpConfig(profileName string, ifaceName, ptp4lOpts *string, ptp4lConfig string, phc2sysOpts *string, nodeLabel string, priority *int64, ptpSchedulingPolicy string, ptpSchedulingPriority *int64) error {
-	return createConfig(profileName, ifaceName, ptp4lOpts, ptp4lConfig, phc2sysOpts, nodeLabel, priority, ptpSchedulingPolicy, ptpSchedulingPriority)
+func CreateInvalidPtpConfig(name string) error {
+    testPriority := int64(1)
+    return createConfig(
+		name,
+		nil,         // ifaceName
+		nil,         // ptp4lOpts
+		"",          // ptp4lConfig
+		nil,         // phc2sysOpts
+		"all-nodes", // nodeLabel
+		&testPriority, // priority
+		SCHED_OTHER,
+		nil, // ptpSchedulingPriority)
+	)
 }
 
 // Discovers the PTP configuration
