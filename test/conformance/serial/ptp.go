@@ -63,6 +63,8 @@ var (
 	clockClassPattern = `^openshift_ptp_clock_class\{(?:config="ptp4l\.\d+\.config",)?node="([^"]+)",process="([^"]+)"\}\s+(\d+)`
 	clockClassRe      = regexp.MustCompile(clockClassPattern)
 )
+
+
 var DesiredMode = testconfig.GetDesiredConfig(true).PtpModeDesired
 
 var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, func() {
@@ -143,6 +145,36 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			}
 		})
 
+	})
+
+	//checking whether the operator is resilient to invalid configurations
+	Context("PTP Operator Resilience to Invalid Configurations", func() {
+		invalidConfigName := "invalid-resilience-test-config"
+		
+		BeforeEach(func() {
+			By("Creating a programmatically invalid PtpConfig")
+			// Create an invalid config by leaving the interface name (ifaceName) as nil
+			err := testconfig.CreateInvalidPtpConfig(invalidConfigName)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create invalid PtpConfig")
+		})
+
+		AfterEach(func() {
+			By("Cleaning up the invalid PtpConfig")
+			err := client.Client.PtpV1Interface.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Delete(context.Background(), invalidConfigName, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete invalid PtpConfig")
+
+		})
+
+		It("Should not crash when an invalid PtpConfig is present", func() {
+			By("Checking if the operator is still running despite invalid configuration")
+			ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=ptp-operator"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(ptpPods.Items)).To(Equal(1), "Expected to find one ptp-operator pod")
+			operatorPod := ptpPods.Items[0]
+
+			// Check that the operator is still running
+			Expect(operatorPod.Status.Phase).To(Equal(v1core.PodRunning), "Operator pod should be in a running state despite the invalid config")
+		})
 	})
 
 	Describe("PTP e2e tests", func() {
