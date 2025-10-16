@@ -168,10 +168,8 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 
 			initialRestartCount, err = getPodRestartCount(&operatorPod, "ptp-operator") 
 			Expect(err).NotTo(HaveOccurred(), "Could not find 'ptp-operator' container status")
-			Expect(initialRestartCount).NotTo(Equal(-1), "Could not find 'ptp-operator' container status")
-			fmt.Printf("Initial restart count is %d\n", initialRestartCount)
 
-			By("Applying an invalid PtpConfig")
+			By(fmt.Sprintf("Applying an invalid PtpConfig, initial restart count is %d", initialRestartCount))
 			err = testconfig.CreateInvalidPtpConfig(invalidConfigName)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create invalid PtpConfig")
 		})
