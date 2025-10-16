@@ -64,7 +64,14 @@ var (
 	clockClassRe      = regexp.MustCompile(clockClassPattern)
 )
 
-
+func getPodRestartCount(pod *v1core.Pod, podName string) (int32, error) {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.Name == podName {	
+			return containerStatus.RestartCount, nil
+		}
+	}
+	return -1, fmt.Errorf("container %s not found", podName)	
+}
 var DesiredMode = testconfig.GetDesiredConfig(true).PtpModeDesired
 
 var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, func() {
@@ -146,12 +153,12 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 		})
 
 	})
-
+	
 	//checking whether the operator is resilient to invalid configurations
 	Context("PTP Operator Resilience to Invalid Configurations", func() {
 		invalidConfigName := "invalid-resilience-test-config"
 		var initialRestartCount int32
-
+		var finalRestartCount int32
 		BeforeEach(func() {
 			By("Getting the operator pod's initial restart count")
 			ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=ptp-operator"})
@@ -159,15 +166,10 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			Expect(len(ptpPods.Items)).To(Equal(1), "Expected to find one ptp-operator pod")
 			operatorPod := ptpPods.Items[0]
 
-			initialRestartCount = -1 // Sentinel value
-			for _, containerStatus := range operatorPod.Status.ContainerStatuses {
-				if containerStatus.Name == "ptp-operator" {
-					initialRestartCount = containerStatus.RestartCount
-					break
-				}
-			}
+			initialRestartCount, err = getPodRestartCount(&operatorPod, "ptp-operator") 
+			Expect(err).NotTo(HaveOccurred(), "Could not find 'ptp-operator' container status")
 			Expect(initialRestartCount).NotTo(Equal(-1), "Could not find 'ptp-operator' container status")
-			By(fmt.Sprintf("Initial restart count is %d", initialRestartCount))
+			fmt.Printf("Initial restart count is %d\n", initialRestartCount)
 
 			By("Applying an invalid PtpConfig")
 			err = testconfig.CreateInvalidPtpConfig(invalidConfigName)
@@ -188,15 +190,10 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=ptp-operator"})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(ptpPods.Items)).To(Equal(1))
-			operatorPod := ptpPods.Items[0]
+			operatorPod := ptpPods.Items[0]	
 
-			var finalRestartCount int32 = -1
-			for _, containerStatus := range operatorPod.Status.ContainerStatuses {
-				if containerStatus.Name == "ptp-operator" {
-					finalRestartCount = containerStatus.RestartCount
-					break
-				}
-			}
+			finalRestartCount, err = getPodRestartCount(&operatorPod, "ptp-operator")
+			Expect(err).NotTo(HaveOccurred(), "Could not find 'ptp-operator' container status after waiting")
 			Expect(finalRestartCount).NotTo(Equal(-1), "Could not find 'ptp-operator' container status after waiting")
 			By(fmt.Sprintf("Final restart count is %d", finalRestartCount))
 
