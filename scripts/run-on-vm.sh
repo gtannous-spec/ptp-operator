@@ -64,6 +64,8 @@ kubectl apply -f certs.yaml
 ./retry.sh 60 5 ./fix-certs.sh
 sleep 5
 
+kubectl apply -f ../ptp-security.yaml
+
 # delete ptp-operator pod
 kubectl delete pods -l name=ptp-operator -n openshift-ptp
 
