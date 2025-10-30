@@ -100,6 +100,8 @@ spec:
                       type: string
                     ts2phcConf:
                       type: string
+                    ptpSecretName:
+                      type: string
                     ts2phcOpts:
                       type: string
                   required:

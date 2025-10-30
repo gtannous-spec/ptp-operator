@@ -74,6 +74,7 @@ type PtpProfile struct {
 	Ts2PhcConf  *string `json:"ts2phcConf,omitempty"`
 	Synce4lConf *string `json:"synce4lConf,omitempty"`
 	ChronydConf *string `json:"chronydConf,omitempty"`
+	PtpSecretName *string `json:"ptpSecretName,omitempty"`
 	// +kubebuilder:validation:Enum=SCHED_OTHER;SCHED_FIFO;
 	PtpSchedulingPolicy *string `json:"ptpSchedulingPolicy,omitempty"`
 	// +kubebuilder:validation:Minimum=1

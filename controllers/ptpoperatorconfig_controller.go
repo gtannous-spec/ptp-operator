@@ -20,6 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+
 	"github.com/go-logr/logr"
 	"github.com/golang/glog"
 	ptpv1 "github.com/k8snetworkplumbingwg/ptp-operator/api/v1"
@@ -35,23 +40,25 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
-	"net/url"
-	"os"
-	"path/filepath"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // PtpOperatorConfigReconciler reconciles a PtpOperatorConfig object
 type PtpOperatorConfigReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	Log       logr.Logger
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 const (
@@ -66,6 +73,8 @@ const (
 // +kubebuilder:rbac:groups=ptp.openshift.io,resources=ptpoperatorconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=config.openshift.io,resources=infrastructures,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=ptp.openshift.io,resources=ptpconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *PtpOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (reconcile.Result, error) {
 	reqLogger := r.Log.WithValues("Request.Namespace", req.Namespace, "Request.Name", req.Name)
@@ -264,12 +273,115 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 		glog.Infof("ptp operator enabled plugins: %s", enabledPlugins)
 	}
 
+	// Discover sa_file paths directly from PtpConfig CRs
+	var saFilePaths []string
+	var chosenSecretName string
+	var chosenSecretKey string
+	chosenSecretKeys := map[string]struct{}{}
+	{
+		glog.Info("Reading sa_files directly from PtpConfig CRs...")
+		ptpConfigs := &ptpv1.PtpConfigList{}
+		if err := r.List(ctx, ptpConfigs); err == nil {
+			glog.Infof("DEBUG: Found %d PtpConfig CRs", len(ptpConfigs.Items))
+			seen := map[string]struct{}{}
+			for _, cfg := range ptpConfigs.Items {
+				glog.Infof("DEBUG: Processing PtpConfig %s with %d profiles", cfg.Name, len(cfg.Spec.Profile))
+				for _, profile := range cfg.Spec.Profile {
+					profileName := "unknown"
+					if profile.Name != nil {
+						profileName = *profile.Name
+					}
+					if profile.Ptp4lConf != nil {
+						glog.Infof("DEBUG: Checking profile %s ptp4lConf for sa_file...", profileName)
+						if sa, ok := extractSaFileFromPtp4lConf(*profile.Ptp4lConf); ok {
+							if _, exists := seen[sa]; !exists {
+								seen[sa] = struct{}{}
+								saFilePaths = append(saFilePaths, sa)
+								glog.Infof("Found sa_file from PtpConfig %s, profile %s: %s", cfg.Name, profileName, sa)
+							}
+						} else {
+							glog.Infof("DEBUG: No sa_file found in profile %s", profileName)
+						}
+					} else {
+						glog.Infof("DEBUG: Profile %s has no ptp4lConf", profileName)
+					}
+				}
+			}
+		} else {
+			glog.Errorf("Failed to list PtpConfigs for sa_file reading: %v", err)
+		}
+
+		// Try to find a PTP security secret by common names
+		if len(saFilePaths) > 0 {
+			secretNames := []string{"ptp-security-conf", "ptp-security", "linuxptp-security"}
+
+			for _, secretName := range secretNames {
+				sec := &corev1.Secret{}
+				glog.Infof("DEBUG: Trying to find secret %s in namespace %s", secretName, names.Namespace)
+				if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: names.Namespace, Name: secretName}, sec); err == nil {
+					glog.Infof("DEBUG: Successfully found secret %s", secretName)
+					// Use any available key from the secret (no hardcoded key names)
+					if len(sec.Data) == 1 {
+						// Single key - use it
+						for k := range sec.Data {
+							chosenSecretKey = k
+							chosenSecretName = secretName
+							chosenSecretKeys = map[string]struct{}{k: {}}
+							glog.Infof("Found PTP security secret '%s' with key '%s'", secretName, k)
+						}
+					} else if len(sec.Data) > 1 {
+						// Multiple keys - use first one found
+						for k := range sec.Data {
+							chosenSecretKeys[k] = struct{}{}
+						}
+						for k := range sec.Data {
+							chosenSecretKey = k
+							chosenSecretName = secretName
+							glog.Infof("Found PTP security secret '%s' with multiple keys, using '%s'", secretName, k)
+							break
+						}
+					}
+
+					if chosenSecretKey != "" {
+						break
+					}
+				} else {
+					glog.Infof("DEBUG: Failed to find secret %s: %v", secretName, err)
+				}
+			}
+		}
+	}
+
 	objs, err = render.RenderTemplate(filepath.Join(names.ManifestDir, "linuxptp/ptp-daemon.yaml"), &data)
 	if err != nil {
 		return fmt.Errorf("failed to render linuxptp daemon manifest: %v", err)
 	}
 
 	for _, obj := range objs {
+		if obj.GetKind() == "DaemonSet" {
+			daemon := &appsv1.DaemonSet{}
+			if err := kscheme.Scheme.Convert(obj, daemon, nil); err == nil {
+				// Inject security volumes/mounts dynamically based on discovered sa_file paths
+				glog.Infof("DEBUG: sa_file detection results - saFilePaths: %v, chosenSecretName: %s, chosenSecretKey: %s", saFilePaths, chosenSecretName, chosenSecretKey)
+				if len(saFilePaths) > 0 && chosenSecretName != "" && chosenSecretKey != "" {
+					injectPtpSecurityVolume(daemon, chosenSecretName, chosenSecretKey, chosenSecretKeys, saFilePaths)
+				} else {
+					if len(saFilePaths) == 0 {
+						glog.Info("DEBUG: No sa_files found in PtpConfig CRs")
+					}
+					if chosenSecretName == "" {
+						glog.Info("DEBUG: No security secret found (tried: ptp-security-conf, ptp-security, linuxptp-security)")
+					}
+					if chosenSecretKey == "" {
+						glog.Info("DEBUG: Security secret found but no valid keys")
+					}
+					glog.Info("No sa_files or security secret found - skipping security volume injection")
+				}
+				if err := kscheme.Scheme.Convert(daemon, obj, nil); err != nil {
+					return fmt.Errorf("failed to convert DaemonSet back to unstructured: %v", err)
+				}
+			}
+		}
 		obj, err = r.setDaemonNodeSelector(defaultCfg, obj)
 		if err != nil {
 			return err
@@ -413,10 +525,138 @@ func (r *PtpOperatorConfigReconciler) syncNodePtpDevice(ctx context.Context, nod
 }
 
 func (r *PtpOperatorConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ptpv1.PtpOperatorConfig{}).
 		Owns(&appsv1.DaemonSet{}).
+		Watches(
+			&ptpv1.PtpConfig{},
+			handler.EnqueueRequestsFromMapFunc(r.mapPtpConfigToPtpOperatorConfig),
+		).
 		Complete(r)
+}
+
+func (r *PtpOperatorConfigReconciler) mapPtpConfigToPtpOperatorConfig(ctx context.Context, obj client.Object) []reconcile.Request {
+	// When any PtpConfig changes, trigger reconciliation of the default PtpOperatorConfig
+	return []reconcile.Request{
+		{NamespacedName: types.NamespacedName{
+			Name:      names.DefaultOperatorConfigName,
+			Namespace: names.Namespace,
+		}},
+	}
+}
+
+// extractSaFileFromPtp4lConf scans the [global] section for a line starting with 'sa_file'
+// and returns the remainder of the line as the path.
+func extractSaFileFromPtp4lConf(conf string) (string, bool) {
+	inGlobal := false
+	sectionHeader := regexp.MustCompile(`^\s*\[[^\]]+\]\s*$`)
+	for _, raw := range strings.Split(conf, "\n") {
+		line := raw
+		// strip inline comments '#' and ';'
+		if idx := strings.IndexAny(line, "#;"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if sectionHeader.MatchString(line) {
+			if strings.EqualFold(strings.TrimSpace(line), "[global]") {
+				inGlobal = true
+				continue
+			}
+			if inGlobal {
+				// leaving global section
+				break
+			}
+			continue
+		}
+		if !inGlobal {
+			continue
+		}
+		low := strings.ToLower(line)
+		if strings.HasPrefix(low, "sa_file") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				return strings.Join(fields[1:], " "), true
+			}
+		}
+	}
+	return "", false
+}
+
+func injectPtpSecurityVolume(ds *appsv1.DaemonSet, secretName string, secretKey string, secretKeys map[string]struct{}, saFilePaths []string) {
+	// 1. Clean up any existing ptp-security-volume first (overwrite, don't duplicate)
+	var cleanedVolumes []corev1.Volume
+	for _, vol := range ds.Spec.Template.Spec.Volumes {
+		if vol.Name != "ptp-security-volume" {
+			cleanedVolumes = append(cleanedVolumes, vol)
+		}
+	}
+	ds.Spec.Template.Spec.Volumes = cleanedVolumes
+
+	// 2. Add the new Volume
+	ds.Spec.Template.Spec.Volumes = append(ds.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: "ptp-security-volume",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: secretName,
+			},
+		},
+	})
+
+	// 3. Find the target container
+	var targetContainer *corev1.Container
+	for i := range ds.Spec.Template.Spec.Containers {
+		if ds.Spec.Template.Spec.Containers[i].Name == "linuxptp-daemon-container" {
+			targetContainer = &ds.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+
+	if targetContainer == nil {
+		glog.Errorf("Could not find container 'linuxptp-daemon-container' to inject VolumeMount")
+		return
+	}
+
+	// 4. Clean up any existing ptp-security-volume mounts (overwrite, don't duplicate)
+	var cleanedMounts []corev1.VolumeMount
+	for _, mount := range targetContainer.VolumeMounts {
+		if mount.Name != "ptp-security-volume" {
+			cleanedMounts = append(cleanedMounts, mount)
+		}
+	}
+	targetContainer.VolumeMounts = cleanedMounts
+
+	// 5. Create new volume mounts for each sa_file path
+	for _, fullPath := range saFilePaths {
+		fullPath = strings.TrimSpace(fullPath)
+		if fullPath == "" {
+			continue
+		}
+
+		// Validate the path has a directory separator
+		if !strings.Contains(fullPath, "/") {
+			glog.Errorf("Invalid sa_file path (no directory separator): %s", fullPath)
+			continue
+		}
+
+		// Determine subPath: prefer filename if the secret has a key with that name; otherwise fall back to chosen secretKey
+		filename := path.Base(fullPath)
+		subPath := secretKey
+		if _, ok := secretKeys[filename]; ok {
+			subPath = filename
+		}
+
+		glog.Infof("Injecting volume mount for sa_file: %s (subPath: %s)", fullPath, subPath)
+		targetContainer.VolumeMounts = append(targetContainer.VolumeMounts, corev1.VolumeMount{
+			Name:      "ptp-security-volume",
+			MountPath: fullPath,
+			ReadOnly:  true,
+			SubPath:   subPath,
+		})
+	}
 }
 
 // EventTransportHostAvailabilityCheck ... check availability for transporthost
