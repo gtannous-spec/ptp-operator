@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Secret
 metadata:
-  name: ptp-security-conf
+  name: ptp-security-secret
   namespace: openshift-ptp
 type: Opaque
 stringData:

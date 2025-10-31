@@ -273,13 +273,13 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 		glog.Infof("ptp operator enabled plugins: %s", enabledPlugins)
 	}
 
-	// Discover sa_file paths directly from PtpConfig CRs
+	// Discover sa_file paths and PtpSecretName directly from PtpConfig CRs
 	var saFilePaths []string
 	var chosenSecretName string
 	var chosenSecretKey string
 	chosenSecretKeys := map[string]struct{}{}
 	{
-		glog.Info("Reading sa_files directly from PtpConfig CRs...")
+		glog.Info("Reading sa_files and PtpSecretName from PtpConfig CRs...")
 		ptpConfigs := &ptpv1.PtpConfigList{}
 		if err := r.List(ctx, ptpConfigs); err == nil {
 			glog.Infof("DEBUG: Found %d PtpConfig CRs", len(ptpConfigs.Items))
@@ -291,6 +291,17 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 					if profile.Name != nil {
 						profileName = *profile.Name
 					}
+
+					// Check for PtpSecretName field first (preferred method)
+					if profile.PtpSecretName != nil && *profile.PtpSecretName != "" {
+						secretName := *profile.PtpSecretName
+						glog.Infof("Found PtpSecretName in profile %s: %s", profileName, secretName)
+						if chosenSecretName == "" {
+							chosenSecretName = secretName
+						}
+					}
+
+					// Also check ptp4lConf for sa_file paths
 					if profile.Ptp4lConf != nil {
 						glog.Infof("DEBUG: Checking profile %s ptp4lConf for sa_file...", profileName)
 						if sa, ok := extractSaFileFromPtp4lConf(*profile.Ptp4lConf); ok {
@@ -311,43 +322,37 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 			glog.Errorf("Failed to list PtpConfigs for sa_file reading: %v", err)
 		}
 
-		// Try to find a PTP security secret by common names
-		if len(saFilePaths) > 0 {
-			secretNames := []string{"ptp-security-conf", "ptp-security", "linuxptp-security"}
+		// Log if no secret name was found from PtpConfig CRs
+		if chosenSecretName == "" && len(saFilePaths) > 0 {
+			glog.Warning("sa_file paths found but no PtpSecretName specified in any PtpConfig profile - skipping secret mount")
+		}
 
-			for _, secretName := range secretNames {
-				sec := &corev1.Secret{}
-				glog.Infof("DEBUG: Trying to find secret %s in namespace %s", secretName, names.Namespace)
-				if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: names.Namespace, Name: secretName}, sec); err == nil {
-					glog.Infof("DEBUG: Successfully found secret %s", secretName)
-					// Use any available key from the secret (no hardcoded key names)
-					if len(sec.Data) == 1 {
-						// Single key - use it
-						for k := range sec.Data {
-							chosenSecretKey = k
-							chosenSecretName = secretName
-							chosenSecretKeys = map[string]struct{}{k: {}}
-							glog.Infof("Found PTP security secret '%s' with key '%s'", secretName, k)
-						}
-					} else if len(sec.Data) > 1 {
-						// Multiple keys - use first one found
-						for k := range sec.Data {
-							chosenSecretKeys[k] = struct{}{}
-						}
-						for k := range sec.Data {
-							chosenSecretKey = k
-							chosenSecretName = secretName
-							glog.Infof("Found PTP security secret '%s' with multiple keys, using '%s'", secretName, k)
-							break
-						}
+		// Load the chosen secret to get its keys
+		if chosenSecretName != "" {
+			sec := &corev1.Secret{}
+			if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: names.Namespace, Name: chosenSecretName}, sec); err == nil {
+				if len(sec.Data) == 1 {
+					// Single key - use it
+					for k := range sec.Data {
+						chosenSecretKey = k
+						chosenSecretKeys = map[string]struct{}{k: {}}
+						glog.Infof("Found PTP security secret '%s' with key '%s'", chosenSecretName, k)
 					}
-
-					if chosenSecretKey != "" {
+				} else if len(sec.Data) > 1 {
+					// Multiple keys - collect all
+					for k := range sec.Data {
+						chosenSecretKeys[k] = struct{}{}
+					}
+					// Use first key as default
+					for k := range sec.Data {
+						chosenSecretKey = k
+						glog.Infof("Found PTP security secret '%s' with multiple keys, using '%s'", chosenSecretName, k)
 						break
 					}
-				} else {
-					glog.Infof("DEBUG: Failed to find secret %s: %v", secretName, err)
 				}
+			} else {
+				glog.Errorf("Failed to load secret %s: %v", chosenSecretName, err)
+				chosenSecretName = "" // Reset if we can't load it
 			}
 		}
 	}
@@ -363,19 +368,19 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 			if err := kscheme.Scheme.Convert(obj, daemon, nil); err == nil {
 				// Inject security volumes/mounts dynamically based on discovered sa_file paths
 				glog.Infof("DEBUG: sa_file detection results - saFilePaths: %v, chosenSecretName: %s, chosenSecretKey: %s", saFilePaths, chosenSecretName, chosenSecretKey)
-				if len(saFilePaths) > 0 && chosenSecretName != "" && chosenSecretKey != "" {
+				if chosenSecretName != "" && chosenSecretKey != "" && len(saFilePaths) > 0 {
+					// Mount secret at paths specified by sa_file in ptp4lConf
+					glog.Infof("Mounting secret '%s' at sa_file paths: %v", chosenSecretName, saFilePaths)
 					injectPtpSecurityVolume(daemon, chosenSecretName, chosenSecretKey, chosenSecretKeys, saFilePaths)
 				} else {
-					if len(saFilePaths) == 0 {
-						glog.Info("DEBUG: No sa_files found in PtpConfig CRs")
-					}
 					if chosenSecretName == "" {
-						glog.Info("DEBUG: No security secret found (tried: ptp-security-conf, ptp-security, linuxptp-security)")
-					}
-					if chosenSecretKey == "" {
+						glog.Info("DEBUG: No PtpSecretName field specified in any PtpConfig profile")
+					} else if chosenSecretKey == "" {
 						glog.Info("DEBUG: Security secret found but no valid keys")
+					} else if len(saFilePaths) == 0 {
+						glog.Warningf("DEBUG: PtpSecretName '%s' specified but no sa_file paths found in ptp4lConf", chosenSecretName)
 					}
-					glog.Info("No sa_files or security secret found - skipping security volume injection")
+					glog.Info("Skipping security volume injection - requires both ptpSecretName and sa_file in ptp4lConf")
 				}
 				if err := kscheme.Scheme.Convert(daemon, obj, nil); err != nil {
 					return fmt.Errorf("failed to convert DaemonSet back to unstructured: %v", err)
@@ -629,7 +634,14 @@ func injectPtpSecurityVolume(ds *appsv1.DaemonSet, secretName string, secretKey 
 	}
 	targetContainer.VolumeMounts = cleanedMounts
 
-	// 5. Create new volume mounts for each sa_file path
+	// 5. Create volume mounts based on sa_file paths from ptp4lConf
+	// The mountPath is the full path from sa_file (e.g., /etc/ptp/icv_security.conf)
+	// The subPath is the filename (last part after /) which should match a key in the secret
+	if len(saFilePaths) == 0 {
+		glog.Warningf("PtpSecretName '%s' specified but no sa_file paths found in ptp4lConf - secret will not be mounted. Please add 'sa_file <path>' to your ptp4lConf.", secretName)
+		return
+	}
+
 	for _, fullPath := range saFilePaths {
 		fullPath = strings.TrimSpace(fullPath)
 		if fullPath == "" {
@@ -642,14 +654,15 @@ func injectPtpSecurityVolume(ds *appsv1.DaemonSet, secretName string, secretKey 
 			continue
 		}
 
-		// Determine subPath: prefer filename if the secret has a key with that name; otherwise fall back to chosen secretKey
+		// Extract filename from the full path - this will be used as subPath
+		// The filename should match a key in the secret
 		filename := path.Base(fullPath)
-		subPath := secretKey
+		subPath := secretKey // Default to the first key found in secret
 		if _, ok := secretKeys[filename]; ok {
 			subPath = filename
 		}
 
-		glog.Infof("Injecting volume mount for sa_file: %s (subPath: %s)", fullPath, subPath)
+		glog.Infof("Injecting volume mount: mountPath=%s, subPath=%s (from secret '%s')", fullPath, subPath, secretName)
 		targetContainer.VolumeMounts = append(targetContainer.VolumeMounts, corev1.VolumeMount{
 			Name:      "ptp-security-volume",
 			MountPath: fullPath,
