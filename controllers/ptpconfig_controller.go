@@ -35,9 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -260,7 +262,66 @@ func (r *PtpConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&ptpv1.PtpConfig{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
 			return object.GetNamespace() == names.Namespace
 		}))).
+		Watches(
+			&corev1.Secret{},
+			&secretEventHandler{client: mgr.GetClient()},
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
+				// Only watch secrets in openshift-ptp namespace
+				return object.GetNamespace() == names.Namespace
+			})),
+		).
 		Complete(r)
+}
+
+// secretEventHandler handles Secret create/delete events and triggers PtpConfig reconciliation
+type secretEventHandler struct {
+	client client.Client
+}
+
+// Create handles Secret creation events
+func (h *secretEventHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+	secret := evt.Object.(*corev1.Secret)
+	glog.Infof("Secret created: %s, triggering PtpConfig reconciliation", secret.Name)
+	h.enqueuePtpConfigReconcile(ctx, q)
+}
+
+// Update handles Secret update events (we don't need to reconcile on updates)
+func (h *secretEventHandler) Update(ctx context.Context, evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+	// Secret content updates are handled by linuxptp-daemon fsnotify
+	// No need to trigger reconciliation here
+}
+
+// Delete handles Secret deletion events
+func (h *secretEventHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+	secret := evt.Object.(*corev1.Secret)
+	glog.Infof("Secret deleted: %s, triggering PtpConfig reconciliation", secret.Name)
+	h.enqueuePtpConfigReconcile(ctx, q)
+}
+
+// Generic handles generic events
+func (h *secretEventHandler) Generic(ctx context.Context, evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+	// Not needed for our use case
+}
+
+// enqueuePtpConfigReconcile enqueues reconciliation requests for all PtpConfigs
+func (h *secretEventHandler) enqueuePtpConfigReconcile(ctx context.Context, q workqueue.RateLimitingInterface) {
+	ptpConfigs := &ptpv1.PtpConfigList{}
+	if err := h.client.List(ctx, ptpConfigs, &client.ListOptions{Namespace: names.Namespace}); err != nil {
+		glog.Errorf("Failed to list PtpConfigs for secret event: %v", err)
+		return
+	}
+
+	// Trigger reconciliation for each PtpConfig
+	for _, cfg := range ptpConfigs.Items {
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      cfg.Name,
+				Namespace: cfg.Namespace,
+			},
+		}
+		q.Add(req)
+		glog.Infof("Enqueued reconciliation for PtpConfig: %s", cfg.Name)
+	}
 }
 
 // secretMount represents a secret and sa_file pair for a profile
@@ -325,7 +386,29 @@ func (r *PtpConfigReconciler) syncLinuxptpDaemonSecrets(ctx context.Context, ptp
 
 	glog.Infof("Found %d unique secret(s) to mount", len(uniqueSecrets))
 
-	// 2. Get the linuxptp-daemon DaemonSet
+	// 2. Filter out secrets that don't exist in the cluster
+	existingSecrets := make(map[string]secretMount)
+	for secretName, mount := range uniqueSecrets {
+		secret := &corev1.Secret{}
+		err := r.Get(ctx, types.NamespacedName{
+			Namespace: names.Namespace,
+			Name:      secretName,
+		}, secret)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				glog.Warningf("Secret '%s' referenced in PtpConfig but not found in cluster - skipping mount", secretName)
+				continue
+			}
+			glog.Errorf("Failed to check existence of secret '%s': %v", secretName, err)
+			continue
+		}
+		glog.Infof("Secret '%s' exists in cluster, will mount", secretName)
+		existingSecrets[secretName] = mount
+	}
+
+	glog.Infof("Found %d existing secret(s) out of %d referenced", len(existingSecrets), len(uniqueSecrets))
+
+	// 3. Get the linuxptp-daemon DaemonSet
 	daemonSet := &appsv1.DaemonSet{}
 	err := r.Get(ctx, types.NamespacedName{
 		Namespace: names.Namespace,
@@ -338,22 +421,22 @@ func (r *PtpConfigReconciler) syncLinuxptpDaemonSecrets(ctx context.Context, ptp
 		}
 		return fmt.Errorf("failed to get linuxptp-daemon DaemonSet: %v", err)
 	}
-	// 3. Remove all old security volumes first
+	// 4. Remove all old security volumes first
 	removeSecurityVolumesFromDaemonSet(daemonSet)
 
-	// 4. Add volumes - iterate over DEDUPLICATED secrets
-	for _, mount := range uniqueSecrets {
+	// 5. Add volumes - iterate over existing secrets only
+	for _, mount := range existingSecrets {
 		glog.Infof("Injecting security volume for secret '%s'", mount.secretName)
 		injectPtpSecurityVolume(daemonSet, mount.secretName)
 	}
-	// 5. Convert to Unstructured and apply with merge (like PtpOperatorConfig does)
+	// 6. Convert to Unstructured and apply with merge (like PtpOperatorConfig does)
 	scheme := kscheme.Scheme
 	updated := &uns.Unstructured{}
 	if err := scheme.Convert(daemonSet, updated, nil); err != nil {
 		return fmt.Errorf("failed to convert DaemonSet to Unstructured: %v", err)
 	}
 
-	// 6. Use apply.ApplyObject which will call MergeObjectForUpdate
+	// 7. Use apply.ApplyObject which will call MergeObjectForUpdate
 	// Set context to indicate this update is from PtpConfig controller
 	// This allows the merge logic to use security volumes from updated (even if empty)
 	ctxWithSource := context.WithValue(ctx, apply.ControllerSourceKey, apply.SourcePtpConfig)
