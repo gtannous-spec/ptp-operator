@@ -126,6 +126,7 @@ func getRecommendProfiles(ptpConfigList *ptpv1.PtpConfigList, node corev1.Node) 
 	idx := buildProfileCRIndex(ptpConfigList)
 
 	profiles := []ptpv1.PtpProfile{}
+	foundNames := make(map[string]bool)
 	for _, cfg := range ptpConfigList.Items {
 		if cfg.Spec.Profile == nil {
 			continue
@@ -137,6 +138,7 @@ func getRecommendProfiles(ptpConfigList *ptpv1.PtpConfigList, node corev1.Node) 
 			if _, exist := profilesNames[*profile.Name]; !exist {
 				continue
 			}
+			foundNames[*profile.Name] = true
 			profileCopy := profile.DeepCopy()
 			qualifiedName := qualifyProfileName(cfg.Name, *profile.Name)
 			profileCopy.Name = &qualifiedName
@@ -149,8 +151,8 @@ func getRecommendProfiles(ptpConfigList *ptpv1.PtpConfigList, node corev1.Node) 
 		}
 	}
 
-	if len(profiles) != len(profilesNames) {
-		return nil, fmt.Errorf("failed to find all the recommended profiles")
+	if len(foundNames) != len(profilesNames) {
+		return nil, fmt.Errorf("Failed to find all the recommended profiles")
 	}
 	// sort profiles by name
 	sort.SliceStable(profiles, func(i, j int) bool {
