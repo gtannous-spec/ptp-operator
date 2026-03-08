@@ -1832,6 +1832,26 @@ spp 0
 	}
 }
 
+// CreateSecurityRogueSecret creates a secret that uses the same spp (1) and key ID (1)
+// as the legitimate ptp-security-conf but with different key material.
+// This simulates a rogue device that guesses the key ID but does not possess the real secret,
+// producing an ICV (Integrity Check Value) mismatch on every authenticated PTP message.
+func CreateSecurityRogueSecret(namespace string) *v1core.Secret {
+	return &v1core.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pkg.PtpSecurityRogueSecretName,
+			Namespace: namespace,
+		},
+		StringData: map[string]string{
+			"ptp-security.conf": `[security_association]
+spp 1
+1 AES128 HEX:DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF
+2 SHA256-128 HEX:CAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABE
+`,
+		},
+	}
+}
+
 // CreateTestSecretForVolumeMountTest creates a test secret for volume mount cleanup testing
 func CreateTestSecretForVolumeMountTest(namespace string) *v1core.Secret {
 	return &v1core.Secret{

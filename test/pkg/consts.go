@@ -40,6 +40,7 @@ const (
 	// test secret names
 	PtpTestVolumeSecretName       = "ptp-test-volume-secret"
 	PtpSecurityMismatchSecretName = "ptp-security-mismatch"
+	PtpSecurityRogueSecretName    = "ptp-security-rogue"
 
 	// node labels
 	PtpGrandmasterNodeLabel    = "ptp/test-grandmaster"

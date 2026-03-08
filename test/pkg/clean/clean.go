@@ -80,6 +80,7 @@ func Secrets() {
 	testSecrets := []string{
 		pkg.PtpTestVolumeSecretName,
 		pkg.PtpSecurityMismatchSecretName,
+		pkg.PtpSecurityRogueSecretName,
 	}
 
 	for _, secretName := range testSecrets {

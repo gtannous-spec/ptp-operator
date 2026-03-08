@@ -730,6 +730,142 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				})
 			})
 
+			It("Rogue master with same Key ID but wrong secret is rejected with ICV failure (negative test)", func() {
+				authEnabled := os.Getenv("PTP_AUTH_ENABLED")
+				if authEnabled != "true" {
+					Skip("Rogue injection test requires PTP_AUTH_ENABLED=true")
+				}
+
+				if fullConfig.PtpModeDesired == testconfig.TelcoGrandMasterClock {
+					Skip("Skipping as slave interface is not available with a WPC-GM profile")
+				}
+
+				var originalGMConfig *ptpv1.PtpConfig
+
+				By("Creating rogue secret with same spp/key ID but different key material", func() {
+					client.Client.Secrets(pkg.PtpLinuxDaemonNamespace).Delete(
+						context.Background(),
+						pkg.PtpSecurityRogueSecretName,
+						metav1.DeleteOptions{},
+					)
+					time.Sleep(2 * time.Second)
+
+					rogueSecret := testconfig.CreateSecurityRogueSecret(pkg.PtpLinuxDaemonNamespace)
+					_, err := client.Client.Secrets(pkg.PtpLinuxDaemonNamespace).Create(
+						context.Background(),
+						rogueSecret,
+						metav1.CreateOptions{},
+					)
+					Expect(err).NotTo(HaveOccurred())
+					fmt.Fprintf(GinkgoWriter, "Created rogue secret (spp 1, key ID 1, wrong key material)\n")
+				})
+
+				By("Switching GM to use rogue secret (same spp 1 but different keys)", func() {
+					ptpConfig, err := client.Client.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Get(
+						context.Background(),
+						pkg.PtpGrandMasterPolicyName,
+						metav1.GetOptions{},
+					)
+					Expect(err).NotTo(HaveOccurred())
+
+					originalGMConfig = ptpConfig.DeepCopy()
+
+					ptp4lConf := *ptpConfig.Spec.Profile[0].Ptp4lConf
+					modifiedConf := strings.Replace(ptp4lConf,
+						"sa_file /etc/ptp-secret-mount/ptp-security-conf/ptp-security.conf",
+						"sa_file /etc/ptp-secret-mount/ptp-security-rogue/ptp-security.conf", 1)
+					ptpConfig.Spec.Profile[0].Ptp4lConf = &modifiedConf
+
+					_, err = client.Client.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Update(
+						context.Background(),
+						ptpConfig,
+						metav1.UpdateOptions{},
+					)
+					Expect(err).NotTo(HaveOccurred())
+
+					fmt.Fprintf(GinkgoWriter, "GM now signs with rogue keys (slaves have legitimate keys for same spp/key ID)\n")
+					time.Sleep(60 * time.Second)
+				})
+
+				By("Verifying slave does NOT reach LOCKED state (2 minute observation)", func() {
+					slavePod := fullConfig.DiscoveredClockUnderTestPod
+					Expect(slavePod).NotTo(BeNil())
+
+					for i := 0; i < 12; i++ {
+						if len(fullConfig.DiscoveredFollowerInterfaces) > 0 {
+							slaveInterface := fullConfig.DiscoveredFollowerInterfaces[0]
+							nodeNameStr := slavePod.Spec.NodeName
+							err := metrics.CheckClockState(metrics.MetricClockStateLocked, slaveInterface, &nodeNameStr)
+							if err == nil {
+								Fail("Slave unexpectedly reached LOCKED state despite ICV mismatch from rogue master")
+								return
+							}
+						}
+						time.Sleep(10 * time.Second)
+					}
+					fmt.Fprintf(GinkgoWriter, "Slave correctly rejected rogue master for 2 minutes\n")
+				})
+
+				By("Verifying ptp4l logs contain authentication failure messages", func() {
+					slavePod := fullConfig.DiscoveredClockUnderTestPod
+					Expect(slavePod).NotTo(BeNil())
+
+					authFailureRegex := `(authentication tlv|auth|ICV).*([Ff]ail|[Bb]ad|mismatch|drop|discard|wrong)`
+					logMatches, err := pods.GetPodLogsRegex(
+						slavePod.Namespace,
+						slavePod.Name,
+						pkg.PtpContainerName,
+						authFailureRegex,
+						false,
+						pkg.TimeoutIn3Minutes,
+					)
+					Expect(err).NotTo(HaveOccurred(),
+						"Expected ptp4l logs to contain authentication failure entries when rogue master sends packets with wrong ICV")
+					Expect(len(logMatches)).To(BeNumerically(">", 0),
+						"No authentication failure log entries found; ptp4l should log ICV verification failures")
+					fmt.Fprintf(GinkgoWriter, "Found %d authentication failure log entries confirming ICV rejection\n", len(logMatches))
+				})
+
+				By("Restoring GM to legitimate authentication secret (cleanup)", func() {
+					Expect(originalGMConfig).NotTo(BeNil(), "Original GM config should have been saved")
+
+					originalGMConfig.SetResourceVersion("")
+
+					err := client.Client.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Delete(
+						context.Background(),
+						pkg.PtpGrandMasterPolicyName,
+						metav1.DeleteOptions{},
+					)
+					Expect(err).NotTo(HaveOccurred())
+
+					time.Sleep(10 * time.Second)
+
+					_, err = client.Client.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Create(
+						context.Background(),
+						originalGMConfig,
+						metav1.CreateOptions{},
+					)
+					Expect(err).NotTo(HaveOccurred())
+
+					client.Client.Secrets(pkg.PtpLinuxDaemonNamespace).Delete(
+						context.Background(),
+						pkg.PtpSecurityRogueSecretName,
+						metav1.DeleteOptions{},
+					)
+
+					fmt.Fprintf(GinkgoWriter, "Restored GM with legitimate authentication secret\n")
+
+					time.Sleep(60 * time.Second)
+					ptphelper.WaitForPtpDaemonToExist()
+					fullConfig = testconfig.GetFullDiscoveredConfig(pkg.PtpLinuxDaemonNamespace, true)
+					podsRunningPTP4l, err := testconfig.GetPodsRunningPTP4l(&fullConfig)
+					Expect(err).NotTo(HaveOccurred())
+					ptphelper.WaitForPtpDaemonToBeReady(podsRunningPTP4l)
+
+					time.Sleep(30 * time.Second)
+				})
+			})
+
 			// Test That clock can sync in dual follower scenario when one port is down
 			It("Dual follower can sync when one follower port goes down", func() {
 				if fullConfig.PtpModeDesired != testconfig.DualFollowerClock {
